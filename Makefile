@@ -26,7 +26,7 @@ installdeps:
 
 .PHONY: entry-point-test
 entry-point-test:
-	cd ~ && python -c "from featuretools.wrappers import DFSTransformer"
+	python -c "from featuretools_sklearn_transformer import DFSTransformer"
 
 .PHONY: package_build
 package_build:
