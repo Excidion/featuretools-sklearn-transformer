@@ -1,6 +1,9 @@
+from featuretools import selection, encode_features
 from featuretools.computational_backends import calculate_feature_matrix
 from featuretools.synthesis import dfs
 from sklearn.base import TransformerMixin
+from sklearn.feature_selection import SelectorMixin
+from sklearn.exceptions import NotFittedError
 
 
 class DFSTransformer(TransformerMixin):
@@ -242,3 +245,176 @@ def parse_x_input(X):
         cutoff_time = None
 
     return es, dataframes, relationships, cutoff_time
+
+
+class DFSSelectionTransformer(DFSTransformer):
+    """Deep Feature Sythesis and Feature Selection Transformer using Scikit-Learn interface for Pipeline usage."""
+
+    def __init__(
+        self,
+        null_threshold=1.0,
+        remove_single_value_features=True,
+        count_null_as_value=True,
+        **dfs_kwargs,
+    ):
+        """Creates a Transformer for feature generation.
+        Will reduce the amount of generated features with some simple heuristics.
+        The reduced featureset overwrites the list of originally generated features.
+        This saves compute when calling `.transform()`.
+
+        Args:
+            null_threshold (float): If ratio of NULL values exceeds this value, that feature will be removed.
+            remove_single_value_features (bool): Remove features with cardinality of 1.
+            count_null_as_value (bool): Treat NULL values as a unique value when removing single value features.
+            **dfs_kwargs (dict): Keyword arguments passed to `DFSTransformer`
+
+        See Also:
+            :class: `DFSTransformer`
+            :function: `featuretools.selection.remove_highly_null_features`
+            :function: `featuretools.selection.remove_single_value_features`
+        """
+        super().__init__(**dfs_kwargs)
+        if (null_threshold == 1) and not remove_single_value_features:
+            ValueError(
+                "Set either 'null_threshold < 1' or 'remove_single_value_features = True'."
+            )
+        self.null_threshold = null_threshold
+        self.remove_single_value_features = remove_single_value_features
+        self.count_null_as_value = count_null_as_value
+
+    def fit(self, X, y=None):
+        """Wrapper for DFS plus and additional feature selection process.
+
+        Calculates a list of features given a dictionary of dataframes and a list
+        of relationships. Alternatively, an EntitySet can be passed instead of
+        the dataframes and relationships.
+
+        This method constructs the features and fits the supplied selector.
+        Optionally some heuristics are used before the selector is fitted.
+
+        Args:
+            X: (ft.Entityset or tuple): Entityset to calculate features on. If a tuple is
+                passed it can take one of these forms: (entityset, cutoff_time_dataframe),
+                (dataframes, relationships), or ((dataframes, relationships), cutoff_time_dataframe)
+            y: (iterable): Training targets
+
+        See Also:
+            :func:`synthesis.dfs`
+        """
+        # don't call 'fit_transfrom' to avoid recursion
+        super().fit(X, y)
+        X = self.transform(X)
+        # apply selection heuristics
+        if self.null_threshold < 1.0:
+            X, self.feature_defs = selection.remove_highly_null_features(
+                feature_matrix=X,
+                features=self.feature_defs,
+                pct_null_threshold=self.null_threshold,
+            )
+        if self.remove_single_value_features:
+            X, self.feature_defs = selection.remove_single_value_features(
+                feature_matrix=X,
+                features=self.feature_defs,
+                count_nan_as_value=self.count_null_as_value,
+            )
+        if len(self.feature_defs) == 0:
+            raise ValueError("Feature selection eliminated all features.")
+        return self
+
+    def get_feature_names_out(self):
+        if len(self.feature_defs) > 0:
+            return [f.generate_name() for f in self.feature_defs]
+        else:
+            raise NotFittedError
+
+
+class DFSSelectorTransformer(DFSSelectionTransformer):
+    """Deep Feature Sythesis and Feature Selection Transformer using Scikit-Learn interface for Pipeline usage."""
+
+    def __init__(
+        self,
+        selector,
+        encode_categorical=True,
+        top_n_categories=10,
+        encode_ordinal=False,
+        **kwargs,
+    ):
+        """Creates a Transformer for feature generation.
+        Will reduce the amount of generated features with the supplied `selector` and (optionally) some heuristics.
+        The reduced featureset overwrites the list of originally generated features.
+        This saves compute when calling `.transform()`.
+
+        Args:
+            selector (sklearn.selector.SelectorMixin): Sklearn selector used for feature selection.
+            encode_categorical (bool): One-hot-encode categorical features.
+            top_n_categories (int): Number of top categories per categorical feature to include.
+            encode_ordinal (bool): One-hot-encode ordinal categorical features.
+            **kwargs (dict): Keyword arguments passed to `DFSSelectionTransformer`
+
+        See Also:
+            :class: `DFSSelectionTransformer`
+            :class: `sklearn.feature_selection.SelectorMixin`
+        """
+        super().__init__(**kwargs)
+        assert isinstance(
+            selector, SelectorMixin
+        ), "'selector' has to be of type 'SelectorMixin'"
+        self.selector = selector
+        self.encode_categorical = encode_categorical
+        self.top_n_categories = top_n_categories
+        if encode_ordinal:
+            assert encode_categorical, "You can only set 'encode_ordinal = True' if also 'encode_categorical = True'."
+        self.encode_ordinal = encode_ordinal
+
+    def fit(self, X, y=None):
+        """Wrapper for DFS plus and additional feature selection process.
+
+        Calculates a list of features given a dictionary of dataframes and a list
+        of relationships. Alternatively, an EntitySet can be passed instead of
+        the dataframes and relationships.
+
+        This method constructs the features and fits the supplied selector.
+        Optionally some heuristics are used before the selector is fitted.
+
+        Args:
+            X: (ft.Entityset or tuple): Entityset to calculate features on. If a tuple is
+                passed it can take one of these forms: (entityset, cutoff_time_dataframe),
+                (dataframes, relationships), or ((dataframes, relationships), cutoff_time_dataframe)
+            y: (iterable): Training targets
+
+        See Also:
+            :func:`synthesis.dfs`
+        """
+        # don't call 'fit_transfrom' to avoid recursion
+        super().fit(X, y)
+        X = super().transform(X)
+        # handle categorical
+        if not self.encode_ordinal:
+            to_encode = [
+                f.generate_name()
+                for f in self.feature_defs
+                if f.primitive.return_type is None  # seems to be only for categorical
+            ]
+        else:
+            to_encode = None  # encode everything
+        if self.encode_categorical:
+            X.ww.init()  # without this the encoding fails
+            X, self.feature_defs = encode_features(
+                feature_matrix=X,
+                features=self.feature_defs,
+                to_encode=to_encode,
+                top_n=self.top_n_categories,
+                include_unknown=True,
+                drop_first=False,
+            )
+        # apply selector
+        self.selector.fit(X, y)
+        mask = self.selector.get_support()
+        assert len(mask) == len(self.feature_defs)
+        self.feature_defs = [f for f, keep in zip(self.feature_defs, mask) if keep]
+        if len(self.feature_defs) == 0:
+            raise ValueError("Feature selection eliminated all features.")
+        return self
+
+    def get_feature_names_out(self):
+        return self.selector.get_feature_names_out()
